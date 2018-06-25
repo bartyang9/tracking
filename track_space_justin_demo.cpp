@@ -13,23 +13,81 @@
 #include <cuda_runtime.h>
 #include <vector_types.h>
 
-#include "depth_sources/image_depth_source.h"
-#include "geometry/plane_fitting.h"
-#include "img_proc/img_ops.h"
-#include "optimization/priors.h"
-#include "tracker.h"
-#include "util/dart_io.h"
-#include "util/gl_dart.h"
-#include "util/image_io.h"
-#include "util/ostream_operators.h"
-#include "util/string_format.h"
-#include "visualization/color_ramps.h"
-#include "visualization/data_association_viz.h"
-#include "visualization/gradient_viz.h"
-#include "visualization/sdf_viz.h"
-#include "model/read_model_urdf.h"
+#include <dart/depth_sources/image_depth_source.h>
+#include <dart/geometry/plane_fitting.h>
+#include <dart/img_proc/img_ops.h>
+#include <dart/optimization/priors.h>
+#include <dart/tracker.h>
+#include <dart/util/dart_io.h>
+#include <dart/util/gl_dart.h>
+#include <dart/util/image_io.h>
+#include <dart/util/ostream_operators.h>
+#include <dart/util/string_format.h>
+#include <dart/visualization/color_ramps.h>
+#include <dart/visualization/data_association_viz.h>
+#include <dart/visualization/gradient_viz.h>
+#include <dart/visualization/sdf_viz.h>
+
+#include <priors.hpp>
 
 #define EIGEN_DONT_ALIGN
+
+// select a robot
+//#define JUSTIN      // using XML model and data files
+#define VALKYRIE    // using URDF model and LCM subscriptions
+
+//#define WITH_BOTTLE
+//#define WITH_BOX
+//#define WITH_RECT
+
+// switch depth sources
+#ifdef JUSTIN
+    #define DEPTH_SOURCE_IMAGE // demo files
+#endif
+
+#ifdef VALKYRIE
+    // read depth images from LCM topic
+    #define DEPTH_SOURCE_LCM
+    #define DEPTH_SOURCE_LCM_MULTISENSE
+    //#define DEPTH_SOURCE_LCM_XTION
+    // read depth (not disparity) images from MultiSense SL, use specific camera parameters
+    //#define DEPTH_SOURCE_IMAGE_MULTISENSE
+    #include <dart_lcm/lcm_state_publish.hpp>
+    #include <dart_lcm/lcm_frame_pose_publish.hpp>
+#endif
+
+#ifdef DEPTH_SOURCE_LCM
+    #include <dart_lcm/dart_lcm_depth_provider.hpp>
+#endif
+
+#ifdef JUSTIN
+    #define ENABLE_JUSTIN
+    // filter point below table plane
+#endif
+
+#ifdef VALKYRIE
+    // FIXME: set by cmake
+    #define ENABLE_URDF
+    #define ENABLE_LCM_JOINTS
+#endif
+
+#ifdef ENABLE_URDF
+    #include <dart_urdf/read_model_urdf.h>
+#endif
+
+#ifdef ENABLE_LCM_JOINTS
+    #include <dart_lcm/dart_lcm_joints.hpp>
+#endif
+
+#ifdef JUSTIN
+    // switch use of contact information
+    #define USE_CONTACT_PRIOR
+#endif
+
+#define LCM_CHANNEL_ROBOT_STATE "EST_ROBOT_STATE"
+//#define LCM_CHANNEL_ROBOT_STATE "EST_ROBOT_STATE_ORG"
+#define LCM_CHANNEL_DART_PREFIX "DART_"
+//#define LCM_CHANNEL_DART_PREFIX "EST_ROBOT"
 
 using namespace std;
 
@@ -53,6 +111,7 @@ enum DebugImgs {
     DebugN
 };
 
+#ifdef ENABLE_JUSTIN
 enum TrackingMode {
     ModeObjOnTable,
     ModeIntermediate,
@@ -73,10 +132,11 @@ std::string getTrackingModeString(const TrackingMode mode) {
     }
 }
 
-const static int panelWidth = 180;
-
 static const int fullArmFingerTipFrames[10] = { 11, 15, 19, 23, 27,  38, 42, 46, 50, 54 };
 static const int handFingerTipFrames[5] = { 4, 8, 12, 16, 20 };
+#endif
+
+const static int panelWidth = 180;
 
 void setSlidersFromTransform(dart::SE3& transform, pangolin::Var<float>** sliders) {
     *sliders[0] = transform.r0.w; transform.r0.w = 0;
@@ -91,6 +151,7 @@ void setSlidersFromTransform(const dart::SE3& transform, pangolin::Var<float>** 
     dart::SE3 mutableTransform = transform;
     setSlidersFromTransform(mutableTransform,sliders);
 }
+#ifdef ENABLE_JUSTIN
 const static dart::SE3 T_wh = dart::SE3FromRotationY(M_PI)*dart::SE3FromRotationX(-M_PI_2)*dart::SE3FromTranslation(make_float3(0,0,0.138));//dart::SE3Fromse3(dart::se3(0,0,0.1,0,2.22144,2.22144)); //dart::SE3art::SE3Fromse3(dart::se3(0, 0.108385,-0.108385, 1.5708, 0, 0)); // = dart::SE3Invert(dart::SE3Fromse3(dart::se3(0, 0.115, -0.115, 1.5708, 0, 0)));
 const static dart::SE3 T_hw = dart::SE3Invert(T_wh);
 const static dart::SE3 T_wc = dart::SE3FromTranslation(make_float3(-0.2,0.8,0))*
@@ -103,23 +164,16 @@ const static int leftShoulderFrame = 28;
 const static int leftPalmFrame = 34;
 const static int headFrame = 56;
 
-void loadReportedJointAnglesAndContacts(std::string jointAngleFile, std::string contactFile,
-                                        std::vector<float *> & jointAngles, std::vector<int *> & contacts) {
-
-    int nFrames, nContactFrames;
+void loadReportedJointAngles(std::string jointAngleFile, std::vector<float *> & jointAngles) {
+    int nFrames;
     int nJoints;
 
-    std::ifstream jointAngleStream, contactStream;
+    std::ifstream jointAngleStream;
     jointAngleStream.open(jointAngleFile);
-    contactStream.open(contactFile);
 
     assert(jointAngleStream.is_open());
-    assert(contactStream.is_open());
 
     jointAngleStream >> nFrames;
-    contactStream >> nContactFrames;
-
-    assert(nFrames == nContactFrames);
 
     jointAngleStream >> nJoints;
 
@@ -130,20 +184,54 @@ void loadReportedJointAnglesAndContacts(std::string jointAngleFile, std::string 
             jointAngleStream >> frameAngles[j];
         }
         jointAngles.push_back(frameAngles);
+    }
 
+    jointAngleStream.close();
+}
+
+void loadReportedContacts(std::string contactFile, std::vector<int *> & contacts) {
+    int nFrames, nContactFrames;
+    int nJoints;
+
+    std::ifstream contactStream;
+    contactStream.open(contactFile);
+
+    contactStream >> nContactFrames;
+
+    for (int i=0; i<nContactFrames; ++i) {
         int * frameContacts = new int[10];
         for (int j=0; j<10; ++j) {
             contactStream >> frameContacts[j];
         }
         contacts.push_back(frameContacts);
-
     }
 
-    jointAngleStream.close();
     contactStream.close();
+}
+#endif
 
+dart::Pose nullReductionPose(const dart::HostOnlyModel &model) {
+    std::vector<float> jointMins, jointMaxs;
+    std::vector<std::string> jointNames;
+    for (int j=0; j<model.getNumJoints(); ++j) {
+        jointMins.push_back(model.getJointMin(j));
+        jointMaxs.push_back(model.getJointMax(j));
+        jointNames.push_back(model.getJointName(j));
+    }
+    return dart::Pose(new dart::NullReduction(model.getNumJoints(),
+                    jointMins.data(), jointMaxs.data(), jointNames.data()));
 }
 
+// debugging function to print all joint positions stored in a pose
+void printPoseJoints(dart::Pose &pose) {
+    const uint ndims = pose.getReducedArticulatedDimensions();
+    std::cout<<"reduced joints ("<<ndims<<"):"<<std::endl;
+    for(uint i=0; i<ndims; i++) {
+        std::cout<<i<<" "<<pose.getReducedName(i)<<": "<<pose.getReducedArticulation()[i]<<std::endl;
+    }
+}
+
+#ifdef ENABLE_JUSTIN
 static const dart::SE3 initialT_cj(make_float4(-0.476295, -0.0945505, -0.874187, -0.22454),
                                    make_float4(-0.625852, 0.734788, 0.26152, -0.305038   ),
                                    make_float4(0.617613, 0.671677, -0.409147, -0.105219  ));
@@ -151,18 +239,20 @@ static const dart::SE3 initialT_cj(make_float4(-0.476295, -0.0945505, -0.874187,
 static const dart::SE3 initialT_co(make_float4(0.262348, -0.955909, -0.131952, 0.0238097),
                                    make_float4(-0.620357, -0.271813, 0.735714, -0.178571),
                                    make_float4(-0.739142, -0.111156, -0.664314, 0.702381));
+#endif
 
 static float3 initialTableNorm = make_float3(0.0182391, 0.665761, -0.745942);
 static float initialTableIntercept = -0.705196;
 
-int main() {
+int main(int argc, char *argv[]) {
 
-    const std::string objectModelFile = "../models/cup/cup.xml";
-    // const std::string objectModelFile = "../models/test/my_robot.urdf";
+#ifdef ENABLE_JUSTIN
+    const std::string objectModelFile = "../models/ikeaMug/ikeaMug.xml";
     const float objObsSdfRes = 0.0025;
     const float3 objObsSdfOffset = make_float3(0,0,0);
 
     const std::string videoLoc = "../video/";
+#endif
 
     // -=-=-=- initializations -=-=-=-
     cudaSetDevice(0);
@@ -171,6 +261,7 @@ int main() {
     pangolin::CreateWindowAndBind("Main",640+4*panelWidth+1,2*480+1);
 
     glewInit();
+    glutInit(&argc, argv);
     dart::Tracker tracker;
 
     // -=-=-=- pangolin window setup -=-=-=-
@@ -185,8 +276,24 @@ int main() {
     int glFL = 400;
     int glPPx = glWidth/2;
     int glPPy = glHeight/2;
+#ifdef ENABLE_JUSTIN
     pangolin::OpenGlMatrixSpec glK = pangolin::ProjectionMatrixRDF_BottomLeft(glWidth,glHeight,glFL,glFL,glPPx,glPPy,0.01,1000);
     pangolin::OpenGlRenderState camState(glK);
+#endif
+#ifdef ENABLE_URDF
+    pangolin::OpenGlMatrixSpec glK = pangolin::ProjectionMatrixRUB_BottomLeft(glWidth,glHeight,glFL,glFL,glPPx,glPPy,0.01,1000);
+    pangolin::OpenGlMatrix viewpoint = pangolin::ModelViewLookAt(0, 0, 0.05, 0, -0.1, 0.2, pangolin::AxisY);
+    //pangolin::OpenGlMatrix viewpoint = pangolin::ModelViewLookAt(0, 0, 0.05, 0, 0, 0.2, pangolin::AxisY);
+    // the MultiSense and the Xtion have different oriented frames
+#ifdef DEPTH_SOURCE_LCM_MULTISENSE
+    // Z forward, Y up
+    pangolin::OpenGlRenderState camState(glK, viewpoint);
+#endif
+#ifdef DEPTH_SOURCE_LCM_XTION
+    // Z forward, Y down
+    pangolin::OpenGlRenderState camState(pangolin::OpenGlMatrix::RotateZ(M_PI)*glK, viewpoint);
+#endif
+#endif
     pangolin::View & camDisp = pangolin::Display("cam").SetAspect(640.0f/480.0f).SetHandler(new pangolin::Handler3D(camState));
 
     pangolin::View & imgDisp = pangolin::Display("img").SetAspect(640.0f/480.0f);
@@ -216,6 +323,7 @@ int main() {
 
     std::vector<pangolin::Var<float> *> sizeVars;
 
+#ifdef DEPTH_SOURCE_IMAGE
     // initialize depth source
 
     dart::ImageDepthSource<ushort,uchar3> * depthSource = new dart::ImageDepthSource<ushort,uchar3>();
@@ -225,6 +333,65 @@ int main() {
 //                            true,videoLoc+"/color",dart::IMAGE_PNG,320,240);
 
     // ----
+#endif
+
+#ifdef DEPTH_SOURCE_IMAGE_TEST
+    dart::ImageDepthSource<uint16_t,uchar3> * depthSource = new dart::ImageDepthSource<uint16_t,uchar3>();
+    depthSource->initialize("../test_video/",dart::IMAGE_PNG, make_float2(525/2,525/2),make_float2(320,240), 640,480,0.001);
+    //depthSource->initialize("../test_video2/",dart::IMAGE_PNG, make_float2(525/2,525/2),make_float2(2,2), 5,4,0.001);
+#endif
+
+#ifdef DEPTH_SOURCE_IMAGE_MULTISENSE
+    dart::ImageDepthSource<uint16_t,uchar3> * depthSource = new dart::ImageDepthSource<uint16_t,uchar3>();
+    depthSource->initialize("../depth_grasping_bottle",dart::IMAGE_PNG, make_float2(556.183166504, 556.183166504),make_float2(512,512), 1024, 1024, 0.001);
+#endif
+
+#ifdef DEPTH_SOURCE_LCM
+    // example of using log file
+    // exit after failure, used to stop publishing when end of logfile is reached
+//    LCM_CommonBase::exitOnFailure(true);
+    //LCM_CommonBase::setProvider("file:///home/christian/Downloads/logs/20160623_cr_arm_moving_IR_pattern/bottle_move.lcmlog");
+//    LCM_CommonBase::setProvider("file:///home/christian/Downloads/logs/20160623_cr_arm_moving_IR_pattern/bottle_move-filtered_b120.lcmlog");
+    //LCM_CommonBase::setProvider("file:///home/christian/Downloads/logs/20160623_cr_arm_moving_IR_pattern/box_move.lcmlog");
+//    LCM_CommonBase::setProvider("file:///home/christian/Downloads/logs/20160727_cr-hand-movement-with-vicon-marker/vicon-arm_movement.lcmlog");
+//    LCM_CommonBase::setProvider("file:///home/christian/Downloads/logs/20160727_cr-hand-movement-with-vicon-marker/vicon-finger_movement.lcmlog");
+#endif
+
+#ifdef DEPTH_SOURCE_LCM_MULTISENSE
+    // Valkyrie Unit D, MultiSense SL
+    dart::StereoCameraParameter val_multisense;
+    val_multisense.focal_length = make_float2(556.183166504, 556.183166504);
+    val_multisense.camera_center = make_float2(512, 512);
+    val_multisense.baseline = 0.07;
+    val_multisense.width = 1024;
+    val_multisense.height = 1024;
+    val_multisense.subpixel_resolution = 1.0/16.0;
+
+    // initialise LCM depth source and listen on channel "CAMERA" in a separate thread
+    dart::LCM_DepthSource<float,uchar3> *depthSource = new dart::LCM_DepthSource<float,uchar3>(val_multisense);
+    depthSource->subscribe_images("CAMERA");
+    //depthSource->subscribe_images("CAMERA_FILTERED");
+    depthSource->setMaxDepthDistance(1.0); // meter
+
+    const std::string cam_frame_name = "left_camera_optical_frame_joint";
+#endif
+
+#ifdef DEPTH_SOURCE_LCM_XTION
+    // Valkyrie Unit D, Asus Xtion PRO Live
+    dart::StereoCameraParameter val_xtion;
+    val_xtion.focal_length = make_float2(528.01442863461716, 528.01442863461716);
+    val_xtion.camera_center = make_float2(320, 267);
+    val_xtion.baseline = 0.075;
+    val_xtion.width = 640;
+    val_xtion.height = 480;
+    val_xtion.depth_resolution = 1.0/1000.0;
+
+    // initialise LCM depth source and listen on channel "CAMERA" in a separate thread
+    dart::LCM_DepthSource<float,uchar3> *depthSource = new dart::LCM_DepthSource<float,uchar3>(val_xtion);
+    depthSource->subscribe_images("OPENNI_FRAME");
+
+    const std::string cam_frame_name = "head_xtion_joint";
+#endif
 
     tracker.addDepthSource(depthSource);
     dart::Optimizer & optimizer = *tracker.getOptimizer();
@@ -237,6 +404,7 @@ int main() {
     pangolin::Var<float> modelSdfResolution("lim.modelSdfResolution",defaultModelSdfResolution,defaultModelSdfResolution/2,defaultModelSdfResolution*2);
     pangolin::Var<float> modelSdfPadding("lim.modelSdfPadding",defaultModelSdfPadding,defaultModelSdfPadding/2,defaultModelSdfPadding*2);
 
+#ifdef ENABLE_JUSTIN
     dart::ParamMapPoseReduction * handPoseReduction = dart::loadParamMapPoseReduction("../models/spaceJustin/justinHandParamMap.txt");
 
     tracker.addModel("../models/spaceJustin/spaceJustinHandRight.xml",
@@ -247,22 +415,19 @@ int main() {
                      make_float3(-0.5*obsSdfSize*obsSdfResolution) + obsSdfOffset, //);
                      handPoseReduction);
 
+
     dart::PosePrior reportedPosePrior(tracker.getPose(0).getReducedDimensions());
     memset(reportedPosePrior.getWeights(),0,6*sizeof(float));
 
     dart::HostOnlyModel spaceJustin;
-    dart::HostOnlyModel baxter;
-     dart::readModelXML("../models/spaceJustin/spaceJustinArmsAndHead.xml",spaceJustin);
-    //dart::readModelXML("../models/ikeaMug/ikeaMug.xml",spaceJustin);
-    //dart::readModelURDF("../models/test/my_robot.urdf",spaceJustin);
+    dart::readModelXML("../models/spaceJustin/spaceJustinArmsAndHead.xml",spaceJustin);
 
     spaceJustin.computeStructure();
-    baxter.computeStructure();
 
     dart::LinearPoseReduction * justinPoseReduction = dart::loadLinearPoseReduction("../models/spaceJustin/spaceJustinPoseReduction.txt");
 
     dart::Pose spaceJustinPose(justinPoseReduction);
-    std::cout << spaceJustinPose.getReducedArticulatedDimensions() << " full justin articulated dimensions" << std::endl;
+//    std::cout << spaceJustinPose.getReducedArticulatedDimensions() << " full justin articulated dimensions" << std::endl;
 
     tracker.addModel(objectModelFile,
                      0.5*modelSdfResolution,
@@ -280,6 +445,136 @@ int main() {
                      obsSdfResolution,
                      make_float3(-0.5*obsSdfSize*obsSdfResolution) + obsSdfOffset,
                      handPoseReduction);
+#endif
+
+#ifdef ENABLE_URDF
+    // original Valkyrie model
+    //const std::string urdf_model_path = "../models/val_description/urdf/valkyrie_sim.urdf";
+    // Valkyrie with attached Asus Xtion PRO LIVE
+    //const std::string urdf_model_path = "../models/val_description/urdf/valkyrie_with_xtion.urdf";
+    const std::string urdf_model_path = "../models/val_description/urdf/valkyrie_sim.urdf";
+
+    // add Valkyrie
+    dart::HostOnlyModel val = dart::readModelURDF(urdf_model_path, "pelvis");
+
+    std::cout<<"found robot: "<<val.getName()<<std::endl;
+
+    // initialize pose with 0 joint values and no full to reduced mapping
+    dart::Pose val_pose = nullReductionPose(val);
+    val_pose.zero();
+
+    // joints/frame IDs for finding transformations
+    const int val_cam_frame_id = val.getJointFrame(val.getJointIdByName(cam_frame_name));
+
+#ifdef WITH_BOTTLE
+    // track bottle
+    dart::HostOnlyModel bottle = dart::readModelURDF("../models/bottle/bottle.urdf");
+    tracker.addModel(bottle, 0.5*modelSdfResolution, modelSdfPadding, 64);
+    // initial bottle pose in camera coordinate system, transformation camera to bottle
+    // rotation according to Tait-Bryan angles: Z_1 Y_2 X_3
+    // e.g. first: rotation around Z-axis, second: rotation around Y-axis, third: rotation around X-axis
+
+    // multisense
+#ifdef DEPTH_SOURCE_LCM_MULTISENSE
+    // lcmlog__2016-04-20__18-51-14-226028__yy-wxm-table-grasping-left-hand
+    // t>1150s
+    const dart::SE3 T_cb = dart::SE3FromTranslation(0.244, -0.3036, 0.5952) * dart::SE3FromEuler(make_float3(0.2244, -0.594, -0.6732));
+
+    // lcmlog__2016-06-23__13-36-34-184696__cr-ir_pattern2
+//    const dart::SE3 T_cb = dart::SE3FromTranslation(-0.0357, -0.1905, 0.5833) * dart::SE3FromEuler(make_float3(-0.4862, 0.1333, -0.9519));
+
+    // dbg: place object far away
+    // workaround for data points no being assigned to single object when tracking
+//    const dart::SE3 T_cb = dart::SE3FromTranslation(-1, -1, 1) * dart::SE3FromEuler(make_float3(-0.4862, 0.1333, -0.9519));
+#endif
+#ifdef DEPTH_SOURCE_LCM_XTION
+    // asus xtion
+    //const dart::SE3 T_cb = dart::SE3FromTranslation(0.1131, -0.07738, 0.6071) * dart::SE3FromEuler(make_float3(2.02, -2.02, 0.4862));
+    //const dart::SE3 T_cb = dart::SE3FromTranslation(0.1131, -0.07738, 0.6071) * dart::SE3FromRotationX(0.4862) * dart::SE3FromRotationY(-2.02) * dart::SE3FromRotationZ(2.02);
+    const dart::SE3 T_cb = dart::SE3FromTranslation(0.1131, -0.07738, 0.6071) * dart::SE3FromRotationX(0.4862) * dart::SE3FromRotationY(-2.02+1.04) * dart::SE3FromRotationZ(2.02);
+#endif
+#endif // BOTTLE
+
+#ifdef WITH_BOX
+    // track box
+    dart::HostOnlyModel box = dart::readModelURDF("../models/box/box.urdf");
+    tracker.addModel(box, 0.5*modelSdfResolution, modelSdfPadding, 64);
+    // initial bottle pose in camera coordinate system, transformation camera to bottle
+    // rotation according to Tait-Bryan angles: Z_1 Y_2 X_3
+    // e.g. first: rotation around Z-axis, second: rotation around Y-axis, third: rotation around X-axis
+
+    // lcmlog__2016-06-23__13-41-58-648227__cr-ir_pattern3
+    const dart::SE3 T_cb = dart::SE3FromTranslation(-0.1012, -0.2143, 0.5655) * dart::SE3FromEuler(make_float3(1.122, 0.5984, -1.085));
+#endif
+
+#ifdef WITH_RECT
+    dart::HostOnlyModel object = dart::readModelURDF("../models/rect_bar/rect.urdf");
+    tracker.addModel(object, 0.5*modelSdfResolution, modelSdfPadding, 64);
+    const dart::SE3 T_cb = dart::SE3FromTranslation(0.2381, -0.2917, 0.5774) * dart::SE3FromEuler(make_float3(0.4488, -0.3366, 0.7854));
+#endif
+
+    // track subparts of Valkyrie
+    //const std::vector<uint8_t> colour_estimated_model = {255, 127, 0}; // orange
+    const std::vector<uint8_t> colour_estimated_model = {255, 200, 0}; // yellow-orange
+    dart::HostOnlyModel val_torso = dart::readModelURDF(urdf_model_path, "torso", "obj", colour_estimated_model);
+
+    const int val_torso_cam_frame_id = val_torso.getJointFrame(val_torso.getJointIdByName(cam_frame_name));
+
+    tracker.addModel(val_torso,
+                     modelSdfResolution,    // modelSdfResolution, def = 0.002
+                     modelSdfPadding,       // modelSdfPadding, def = 0.07
+                     obsSdfSize,
+                     obsSdfResolution,
+                     make_float3(-0.5*obsSdfSize*obsSdfResolution) + obsSdfOffset,
+                     0,         // poseReduction
+                     1e5,       // collisionCloudDensity (def = 1e5)
+                     true      // cacheSdfs
+                     );
+
+    // position priors
+    // define 4 corresponding points in world camera and valkyrie camera frame
+    // to fix head to reported head pose
+//    const float point_weight = 1000000000;
+//    dart::Point3D3DPrior val_camera_origin0(tracker.getModelIDbyName("valkyrie"), val_torso_cam_frame_id, make_float3(0, 0, 0), make_float3(0, 0, 0), point_weight);
+//    dart::Point3D3DPrior val_camera_origin1(tracker.getModelIDbyName("valkyrie"), val_torso_cam_frame_id, make_float3(1, 0, 0), make_float3(1, 0, 0), point_weight);
+//    dart::Point3D3DPrior val_camera_origin2(tracker.getModelIDbyName("valkyrie"), val_torso_cam_frame_id, make_float3(0, 1, 0), make_float3(0, 1, 0), point_weight);
+//    dart::Point3D3DPrior val_camera_origin3(tracker.getModelIDbyName("valkyrie"), val_torso_cam_frame_id, make_float3(0, 0, 1), make_float3(0, 0, 1), point_weight);
+
+//    tracker.addPrior(&val_camera_origin0);
+//    tracker.addPrior(&val_camera_origin1);
+//    tracker.addPrior(&val_camera_origin2);
+//    tracker.addPrior(&val_camera_origin3);
+
+    // weighted L2 norm
+//    dart::WeightedL2NormOfError val_rep(tracker.getModelIDbyName("valkyrie"), val_pose, tracker.getPose("valkyrie"), 1);
+
+    // individually weighted joints
+//    const unsigned int val_torso_dims = tracker.getPose(tracker.getModelIDbyName("valkyrie")).getReducedArticulatedDimensions();
+//    // TODO: replace Q by sparse matrix
+//    Eigen::MatrixXf Q = 1 * Eigen::MatrixXf::Identity(val_torso_dims, val_torso_dims);
+
+//    // change weights for left fingers in index 11..23
+//    for(unsigned int i=11; i<=23; i++) {
+//        Q(i,i) = 0.2;
+//        //Q(i,i) = 2.0;
+//    }
+//    // change weights for left wrist roll/pitch in index 6,7
+//    for(unsigned int i=6; i<=7; i++) {
+//        Q(i,i) = 1;
+//        //Q(i,i) = 5;
+//        //Q(i,i) = 25;
+//    }
+
+//    dart::QWeightedError val_rep(tracker.getModelIDbyName("valkyrie"), val_pose, tracker.getPose("valkyrie"), Q);
+
+//    tracker.addPrior(&val_rep);
+
+    // prevent movement of the camera frame by enforcing no transformation
+    dart::NoCameraMovementPrior val_cam(tracker.getModelIDbyName("valkyrie"));
+    tracker.addPrior(&val_cam);
+#endif
+
+    std::cout<<"added models: "<<tracker.getNumModels()<<std::endl;
 
     std::vector<pangolin::Var<float> * *> poseVars;
 
@@ -305,26 +600,42 @@ int main() {
     }
 
     // pangolin variables
-    static pangolin::Var<bool> trackFromVideo("ui.track",false,false,true);
+//    static pangolin::Var<bool> trackFromVideo("ui.track",false,false,true);
+    static pangolin::Var<bool> trackFromVideo("ui.track",true,false,true);
     static pangolin::Var<bool> stepVideo("ui.stepVideo",false,false);
     static pangolin::Var<bool> stepVideoBack("ui.stepVideoBack",false,false);
+#ifdef ENABLE_URDF
+    static pangolin::Var<bool> resetRobotPose("ui.resetRobotPose",false,false);
+    static pangolin::Var<bool> useReportedPose("ui.useReportedPose",false,true);
+#endif
 
     static pangolin::Var<float> sigmaPixels("ui.sigmaPixels",3.0,0.01,4);
     static pangolin::Var<float> sigmaDepth("ui.sigmaDepth",0.1,0.001,1);
     static pangolin::Var<float> focalLength("ui.focalLength",depthSource->getFocalLength().x,0.8*depthSource->getFocalLength().x,1.2*depthSource->getFocalLength().x);//475,525); //525.0,450.0,600.0);
+    //static pangolin::Var<float> focalLength_y("ui.focalLength_y",depthSource->getFocalLength().y, 500, 1500);
     static pangolin::Var<bool> showCameraPose("ui.showCameraPose",false,true);
     static pangolin::Var<bool> showEstimatedPose("ui.showEstimate",true,true);
-    static pangolin::Var<bool> showReported("ui.showReported",false,true);
+    //static pangolin::Var<bool> showEstimatedPose("ui.showEstimate",false,true);
+    //static pangolin::Var<bool> showReported("ui.showReported",false,true);
+    static pangolin::Var<bool> showReported("ui.showReported",true,true);
 
+#ifdef JUSTIN
     static pangolin::Var<bool> showTablePlane("ui.showTablePlane",false,true);
+#endif
 
     static pangolin::Var<bool> showVoxelized("ui.showVoxelized",false,true);
     static pangolin::Var<float> levelSet("ui.levelSet",0.0,-10.0,10.0);
     static pangolin::Var<bool> showTrackedPoints("ui.showPoints",true,true);
+#ifdef DEPTH_SOURCE_LCM
+    static pangolin::Var<bool> showPointColour("ui.showColour",true,true);
+#else
+    static pangolin::Var<bool> showPointColour("ui.showColour",false,true);
+#endif
     static pangolin::Var<int> pointColoringObs("ui.pointColoringObs",0,0,NumPointColorings-1);
     static pangolin::Var<int> pointColoringPred("ui.pointColoringPred",0,0,NumPointColorings-1);
-
+#ifdef JUSTIN
     static pangolin::Var<float> planeOffset("ui.planeOffset",-0.03,-0.05,0);
+#endif
 
     static pangolin::Var<int> debugImg("ui.debugImg",DebugN,0,DebugN);
 
@@ -332,6 +643,7 @@ int main() {
     static pangolin::Var<bool> showPredictedPoints("ui.showPredictedPoints",false,true);
     static pangolin::Var<bool> showCollisionClouds("ui.showCollisionClouds",false,true);
 
+    static pangolin::Var<bool> record("ui.Record Start/Stop",false,false);
     static pangolin::Var<float> fps("ui.fps",0);
 
     // optimization options
@@ -345,23 +657,27 @@ int main() {
     pangolin::Var<float> stabilityThreshold("opt.stabilityThreshold",7.5e-6,5e-6,1e-5);
     pangolin::Var<float> lambdaModToObs("opt.lambdaModToObs",0.5,0,1);
     pangolin::Var<float> lambdaObsToMod("opt.lambdaObsToMod",1,0,1);
+#ifdef USE_CONTACT_PRIOR
     pangolin::Var<float> lambdaIntersection("opt.lambdaIntersection",1.f,0,40);
     //pangolin::Var<float> selfIntersectWeight("opt.selfIntersectWeight",atof(argv[2]),0,40);
     pangolin::Var<float> lambdaContact("opt.lambdaContact",1.f,0,200);
+#endif
 
 
     pangolin::Var<float> infoAccumulationRate("opt.infoAccumulationRate",0.1,0.0,1.0); // 0.8
     pangolin::Var<float> maxRotationDamping("opt.maxRotationalDamping",50,0,200);
     pangolin::Var<float> maxTranslationDamping("opt.maxTranslationDamping",5,0,10);
 
+#ifdef JUSTIN
     pangolin::Var<float> tableNormX("opt.tableNormX",initialTableNorm.x,-1,1);
     pangolin::Var<float> tableNormY("opt.tableNormY",initialTableNorm.y,-1,1);
     pangolin::Var<float> tableNormZ("opt.tableNormZ",initialTableNorm.z,-1,1);
     pangolin::Var<float> tableIntercept("opt.tableIntercept",initialTableIntercept,-1,1);
-
     static pangolin::Var<bool> fitTable("opt.fitTable",true,true);
     static pangolin::Var<bool> subtractTable("opt.subtractTable",true,true);
+#endif
 
+#ifdef USE_CONTACT_PRIOR
     static pangolin::Var<bool> * contactVars[10];
     contactVars[0] = new pangolin::Var<bool>("lim.contactThumbR",false,true);
     contactVars[1] = new pangolin::Var<bool>("lim.contactIndexR",false,true);
@@ -374,6 +690,7 @@ int main() {
     contactVars[8] = new pangolin::Var<bool>("lim.contactRingL",false,true);
     contactVars[9] = new pangolin::Var<bool>("lim.contactLittleL",false,true);
     bool anyContact = false;
+#endif
 
     int fpsWindow = 10;
     pangolin::basetime lastTime = pangolin::TimeNow();
@@ -408,12 +725,17 @@ int main() {
     dart::OptimizationOptions & opts = tracker.getOptions();
     opts.lambdaObsToMod = 1;
     memset(opts.lambdaIntersection.data(),0,tracker.getNumModels()*tracker.getNumModels()*sizeof(float));
+#ifdef USE_CONTACT_PRIOR
     opts.contactThreshold = 0.02;
+#endif
+#ifdef JUSTIN
     opts.planeNormal[0] =  make_float3(0,0,1);
     opts.planeNormal[2] = make_float3(0,0,1);
     opts.planeNormal[1] = make_float3(0,0,0);
+#endif
     opts.regularization[0] = opts.regularization[1] = opts.regularization[2] = 0.01;
 
+#ifdef USE_CONTACT_PRIOR
     float3 initialContact = make_float3(0,0.02,0);
 
     std::vector<dart::ContactPrior *> contactPriors;
@@ -428,7 +750,9 @@ int main() {
         contactPriors.push_back(prior);
         tracker.addPrior(prior);
     }
+#endif
 
+#ifdef ENABLE_JUSTIN
     // set up potential intersections
     {
 
@@ -440,8 +764,9 @@ int main() {
         delete [] selfIntersectionMatrix;
 
     }
+#endif
 
-
+#ifdef ENABLE_JUSTIN
     dart::MirroredModel & rightHand = tracker.getModel(0);
     dart::MirroredModel & leftHand = tracker.getModel(2);
     dart::MirroredModel & object = tracker.getModel(1);
@@ -449,17 +774,57 @@ int main() {
     dart::Pose & rightHandPose = tracker.getPose(0);
     dart::Pose & leftHandPose = tracker.getPose(2);
     dart::Pose & objectPose = tracker.getPose(1);
+#endif
+
+#ifdef ENABLE_URDF
+    // get references to model and its pose for tracking
+    dart::MirroredModel & val_torso_mm = tracker.getModel(tracker.getModelIDbyName("valkyrie"));
+    dart::Pose & val_torso_pose = tracker.getPose("valkyrie");
+#ifdef WITH_BOTTLE
+    dart::Pose & bottle_pose = tracker.getPose("bottle");
+#endif
+#ifdef WITH_BOX
+    dart::Pose & box_pose = tracker.getPose("box");
+#endif
+#ifdef WITH_RECT
+    dart::Pose &object_pose = tracker.getPose("rect");
+#endif
+#endif
 
 
+#ifdef ENABLE_JUSTIN
     // set up reported pose offsets
     std::vector<float *> reportedJointAngles;
-    std::vector<int *> reportedContacts;
-    loadReportedJointAnglesAndContacts(videoLoc+"/reportedJointAngles.txt",videoLoc+"/reportedContacts.txt",
-                                       reportedJointAngles,reportedContacts);
+    loadReportedJointAngles(videoLoc+"/reportedJointAngles.txt", reportedJointAngles);
+#endif
 
+#ifdef USE_CONTACT_PRIOR
+    std::vector<int *> reportedContacts;
+    loadReportedContacts(videoLoc+"/reportedContacts.txt", reportedContacts);
+#endif
+
+#ifdef ENABLE_JUSTIN
     std::cout << "loaded " << reportedJointAngles.size() << " frames" << std::endl;
+#endif
+
+#ifdef ENABLE_LCM_JOINTS
+    // measures joint values for reported robot configuration
+    dart::LCM_JointsProvider lcm_joints;
+    lcm_joints.setJointNames(val);
+    // listen on channel "EST_ROBOT_STATE" in a separate thread
+    lcm_joints.subscribe_robot_state(LCM_CHANNEL_ROBOT_STATE);
+
+    dart::LCM_StatePublish lcm_robot_state(LCM_CHANNEL_ROBOT_STATE, LCM_CHANNEL_DART_PREFIX, val_torso_pose);
+    dart::LCM_FramePosePublish lcm_frame_pub("DART", val, val_torso_mm);
+
+#ifdef WITH_BOTTLE
+    dart::MirroredModel & bottle_mm = tracker.getModel(tracker.getModelIDbyName("bottle"));
+    dart::LCM_FramePosePublish lcm_object_frame_pub("DART", bottle, bottle_mm);
+#endif
+#endif
 
     // -=-=-=-=- set up initial poses -=-=-=-=-
+#ifdef ENABLE_JUSTIN
     spaceJustinPose.setTransformModelToCamera(initialT_cj);
     memcpy(spaceJustinPose.getReducedArticulation(),reportedJointAngles[depthSource->getFrame()],spaceJustinPose.getReducedArticulatedDimensions()*sizeof(float));
     spaceJustinPose.projectReducedToFull();
@@ -472,18 +837,43 @@ int main() {
     leftHandPose.setTransformModelToCamera(spaceJustin.getTransformFrameToCamera(leftPalmFrame)*T_wh);
     memcpy(leftHandPose.getReducedArticulation(),spaceJustinPose.getReducedArticulation() + 7 + 15 + 7,leftHandPose.getReducedArticulatedDimensions()*sizeof(float));
     leftHand.setPose(leftHandPose);
+#endif
 
+#ifdef ENABLE_URDF
+    // wait to get initial configuration of robot from LCM thread
+    usleep(100000);
+    // set initial state of tracked model
+    val_torso_pose.setReducedArticulation(lcm_joints.getJointsNameValue());
+    val_torso_mm.setPose(val_torso_pose);
+    dart::SE3 Tmc = val_torso_mm.getTransformModelToFrame(val_torso_cam_frame_id);
+    val_torso_pose.setTransformModelToCamera(Tmc);
+#ifdef WITH_BOTTLE
+    bottle_pose.setTransformModelToCamera(T_cb);
+    bottle.setPose(bottle_pose);
+#endif
+#ifdef WITH_BOX
+    box_pose.setTransformModelToCamera(T_cb);
+    box.setPose(box_pose);
+#endif
+#ifdef WITH_RECT
+    object_pose.setTransformModelToCamera(T_cb);
+    object.setPose(object_pose);
+#endif
+#endif
+
+#ifdef ENABLE_JUSTIN
     const dart::SE3 T_camera_head = spaceJustin.getTransformFrameToCamera(headFrame);
 
     objectPose.setTransformModelToCamera(initialT_co);
     object.setPose(objectPose);
 
-    TrackingMode trackingMode = ModeObjOnTable;
-
     if ( isnan(spaceJustinPose.getArticulation()[0])) {
         std::cerr << "???" << std::endl;
         spaceJustinPose.projectReducedToFull();
     }
+
+    TrackingMode trackingMode = ModeObjOnTable;
+#endif
 
     // ------------------- main loop ---------------------
     for (int pangolinFrame=1; !pangolin::ShouldQuit(); ++pangolinFrame) {
@@ -492,6 +882,32 @@ int main() {
             pangolin::DisplayBase().ActivateScissorAndClear();
         }
 
+#ifdef ENABLE_URDF
+        tracker.stepForward();
+#endif
+
+#ifdef ENABLE_LCM_JOINTS
+#ifdef ENABLE_URDF
+        // get reported Valkyrie configuration
+        val_pose.setReducedArticulation(lcm_joints.getJointsNameValue());
+        // transform coordinate origin to camera image centre
+        dart::SE3 Tmc = val.getTransformModelToFrame(val_cam_frame_id);
+        val_pose.setTransformModelToCamera(Tmc);
+#endif
+#endif
+
+#ifdef ENABLE_URDF
+        if(pangolin::Pushed(resetRobotPose) || useReportedPose) {
+#ifdef ENABLE_LCM_JOINTS
+            val_torso_pose.setReducedArticulation(lcm_joints.getJointsNameValue());
+#endif
+            val_torso_mm.setPose(val_torso_pose);
+            dart::SE3 Tmc = val_torso_mm.getTransformModelToFrame(val_torso_cam_frame_id);
+            val_torso_pose.setTransformModelToCamera(Tmc);
+        }
+#endif
+
+#ifdef ENABLE_JUSTIN
         static pangolin::Var<std::string> trackingModeStr("ui.mode");
         trackingModeStr = getTrackingModeString(trackingMode);
 
@@ -503,6 +919,7 @@ int main() {
 
         opts.lambdaIntersection[1 + 3*2] = lambdaIntersection; // object->left
         opts.lambdaIntersection[2 + 3*1] = lambdaIntersection; // left->object
+#endif
 
         opts.focalLength = focalLength;
         opts.normThreshold = normalThreshold;
@@ -510,13 +927,19 @@ int main() {
             opts.distThreshold[m] = distanceThreshold;
         }
         opts.regularization[0] = opts.regularization[1] = opts.regularization[2] = 0.01;
+#ifdef ENABLE_JUSTIN
         opts.regularizationScaled[0] = handRegularization;
         opts.regularizationScaled[1] = objectRegularization;
         opts.regularizationScaled[2] = handRegularization;
+#endif
+#ifdef JUSTIN
         opts.planeOffset[2] = planeOffset;
+#endif
         opts.lambdaObsToMod = lambdaObsToMod;
         opts.lambdaModToObs = lambdaModToObs;
+#ifdef JUSTIN
         opts.planeOffset[0] = planeOffset;
+#endif
         opts.debugObsToModDA = pointColoringObs == PointColoringDA || (debugImg == DebugObsToModDA);
         opts.debugModToObsDA = debugImg == DebugModToObsDA;
         opts.debugObsToModErr = ((pointColoringObs == PointColoringErr) || (debugImg == DebugObsToModErr));
@@ -580,11 +1003,16 @@ int main() {
             // run optimization method
             if (trackFromVideo || iteratePushed ) {
 
-                tracker.optimizePoses();
+                // workaround: we need to wait 1 frame before starting optimization
+                // otherwise, the no movement prior produces a wrong update
+                if(pangolinFrame>1)
+                    tracker.optimizePoses();
 
                 // update accumulated info
                 for (int m=0; m<tracker.getNumModels(); ++m) {
+#ifdef ENABLE_JUSTIN
                     if (m == 1 && trackingMode == ModeIntermediate) { continue; }
+#endif
                     const Eigen::MatrixXf & JTJ = *tracker.getOptimizer()->getJTJ(m);
                     if (JTJ.rows() == 0) { continue; }
                     Eigen::MatrixXf & dampingMatrix = tracker.getDampingMatrix(m);
@@ -615,6 +1043,14 @@ int main() {
                     *poseVars[m][5] = t_cm.p[5];
                 }
 
+#ifdef ENABLE_LCM_JOINTS
+                // publish optimized pose
+                lcm_robot_state.publish_estimate();
+                // publish frame poses of reported and estimated model
+                lcm_frame_pub.publish_frame_pose("leftWristPitch");
+
+                //lcm_object_frame_pub.publish_frame_pose("joint1");
+#endif
             }
 
         }
@@ -640,6 +1076,16 @@ int main() {
         camDisp.ActivateAndScissor(camState);
 
         glPushMatrix();
+#ifdef ENABLE_URDF
+        //static pangolin::Var<bool> showAxes("ui.showAxes",true,true);
+        static pangolin::Var<bool> showAxes("ui.showAxes",false,true);
+        if(showAxes) {
+            // draw coordinates axes, x: red, y: green, z: blue
+            pangolin::glDrawAxis(0.5);
+            glColor3f(0,0,1);
+            pangolin::glDraw_z0(0.01, 10);
+        }
+#endif
 
         if (showCameraPose) {
 
@@ -685,10 +1131,20 @@ int main() {
 
         if (showReported) {
             glColor3ub(0xfa,0x85,0x7c);
+            glEnable(GL_COLOR_MATERIAL);
+
+#ifdef ENABLE_JUSTIN
             memcpy(spaceJustinPose.getReducedArticulation(),reportedJointAngles[depthSource->getFrame()],spaceJustinPose.getReducedArticulatedDimensions()*sizeof(float));
             spaceJustinPose.projectReducedToFull();
             spaceJustin.setPose(spaceJustinPose);
             spaceJustin.renderWireframe();
+#endif
+
+#ifdef ENABLE_URDF
+            // render Valkyrie reported state as wireframe model, origin is the camera centre
+            val.setPose(val_pose);
+            val.renderWireframe();
+#endif
 
             // glColor3ub(0,0,0);
             // glutSolidSphere(0.02,10,10);
@@ -696,6 +1152,7 @@ int main() {
 
         glPointSize(1.0f);
 
+#ifdef JUSTIN
         if (showTablePlane) {
 
             float3 normal = normalize(make_float3(tableNormX,tableNormY,tableNormZ));
@@ -722,6 +1179,7 @@ int main() {
             glEnd();
 
         }
+#endif
 
         if (showObsSdf) {
             static pangolin::Var<float> levelSet("ui.levelSet",0,-10,10);
@@ -746,6 +1204,11 @@ int main() {
             glEnableClientState(GL_VERTEX_ARRAY);
             glDisableClientState(GL_NORMAL_ARRAY);
             glVertexPointer(4, GL_FLOAT, 0, 0);
+
+            if(showPointColour)
+                pointColoringObs = PointColoringRGB;
+            else if(pointColoringObs == PointColoringRGB)
+                pointColoringObs = PointColoringNone;
 
             switch (pointColoringObs) {
             case PointColoringNone:
@@ -805,6 +1268,7 @@ int main() {
 
         }
 
+#ifdef USE_CONTACT_PRIOR
         static pangolin::Var<bool> showFingerContacts("ui.showContacts",true,true);
         if (showFingerContacts) {
 
@@ -829,6 +1293,7 @@ int main() {
             glEnd();
 
         }
+#endif
 
         if (showPredictedPoints) {
 
@@ -925,7 +1390,8 @@ int main() {
                 static const float depthMin = 0.3;
                 static const float depthMax = 1.0;
 
-                const unsigned short * depth = depthSource->getDepth();
+                //const unsigned short * depth = depthSource->getDepth();
+                const auto * depth = depthSource->getDepth();
 
                 for (int i=0; i<depthSource->getDepthWidth()*depthSource->getDepthHeight(); ++i) {
                     if (depth[i] == 0) {
@@ -1021,14 +1487,18 @@ int main() {
             std::cerr << cudaGetErrorString(err) << std::endl;
         }
 
+        if(pangolin::Pushed(record)) {
+                pangolin::DisplayBase().RecordOnRender("ffmpeg:[fps=50,bps=8388608,unique_filename]//screencap.avi");
+        }
+
         pangolin::FinishFrame();
 
         if (pangolin::Pushed(stepVideo) || trackFromVideo || pangolinFrame == 1) {
-
+#ifdef ENABLE_JUSTIN
             tracker.stepForward();
 
             const float * currentReportedPose = reportedJointAngles[depthSource->getFrame()];
-            const float * lastReportedPose = reportedJointAngles[depthSource->getFrame()-1];
+            const float * lastReportedPose = (depthSource->getFrame()==0) ? currentReportedPose :  reportedJointAngles[depthSource->getFrame()-1];
 
             memcpy(spaceJustinPose.getReducedArticulation(),lastReportedPose,spaceJustinPose.getReducedArticulatedDimensions()*sizeof(float));
             spaceJustinPose.projectReducedToFull();
@@ -1101,7 +1571,9 @@ int main() {
                 object.setPose(objectPose);
 
             }
+#endif
 
+#ifdef USE_CONTACT_PRIOR
             // update contact vars
             const int * contact = reportedContacts[depthSource->getFrame()];
             for (int i=0; i<10; ++i) {
@@ -1110,7 +1582,9 @@ int main() {
                 *contactVars[i] = inContact;
                 contactPriors[i]->setWeight(inContact ? lambdaContact : 0);
             }
+#endif
 
+#ifdef ENABLE_JUSTIN
             // update table based on head movement
             {
                 float4 tableNorm = make_float4(normalize(make_float3(tableNormX,tableNormY,tableNormZ)),0.f);
@@ -1122,7 +1596,9 @@ int main() {
                 tableNormZ = tableNorm.z;
                 tableIntercept = dot(make_float3(tablePoint),make_float3(tableNorm));
             }
+#endif
 
+#ifdef JUSTIN
             static pangolin::Var<float> planeFitNormThresh("opt.planeNormThresh",0.25,-1,1);
             static pangolin::Var<float> planeFitDistThresh("opt.planeDistThresh",0.005,0.0001,0.005);
 
@@ -1150,18 +1626,25 @@ int main() {
                 tracker.subtractPlane(make_float3(tableNormX,tableNormY,tableNormZ),
                                       tableIntercept,0.005,-1.01);
             }
+#endif
 
+#ifdef ENABLE_JUSTIN
             float totalPerPointError = optimizer.getErrPerObsPoint(1,0) + optimizer.getErrPerModPoint(1,0);
 
             switch (trackingMode) {
             case ModeObjOnTable:
+#ifdef USE_CONTACT_PRIOR
                 if (anyContact || totalPerPointError > resetInfoThreshold) {
+#else
+                if (totalPerPointError > resetInfoThreshold) {
+#endif
                     trackingMode = ModeIntermediate;
                     tracker.getDampingMatrix(1) = Eigen::MatrixXf::Zero(6,6);
                 }
                 break;
             case ModeIntermediate:
                 if (totalPerPointError < stabilityThreshold) {
+#ifdef USE_CONTACT_PRIOR
                     if (anyContact) {
                         bool contactRight = false;
                         for (int i=0; i<5; ++i) { contactRight = contactRight || *contactVars[i]; }
@@ -1169,22 +1652,32 @@ int main() {
                     } else {
                         trackingMode = ModeObjOnTable;
                     }
+#else
+                    trackingMode = ModeObjOnTable;
+#endif
                 }
                 break;
             case ModeObjGrasped:
             case ModeObjGraspedLeft:
+#ifdef USE_CONTACT_PRIOR
                 if (!anyContact || totalPerPointError > resetInfoThreshold) {
+#else
+                if (true) {
+#endif
                     trackingMode = ModeIntermediate;
                     tracker.getDampingMatrix(1) = Eigen::MatrixXf::Zero(6,6);
                 }
                 break;
             }
+#endif
 
         } else {
+#ifdef USE_CONTACT_PRIOR
             for (int i=0; i<10; ++i) {
                 bool inContact =  *contactVars[i];
                 contactPriors[i]->setWeight(inContact ? lambdaContact : 0);
             }
+#endif
         }
 
     }
@@ -1204,9 +1697,11 @@ int main() {
         delete sizeVars[i];
     }
 
+#ifdef USE_CONTACT_PRIOR
     for (int i=0; i<10; ++i) {
         delete contactVars[i];
     }
+#endif
 
     delete depthSource;
 
